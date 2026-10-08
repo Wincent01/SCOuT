@@ -1,0 +1,109 @@
+{
+  "backend": "parser",
+  "project": {
+    "dir": "/cephyr/users/wincenth/Vera/ra/gromacs/gromacs-2026.3",
+    "build_system": "cmake",
+    "target": "gmx",
+    "executable": "bin/gmx",
+    "cmake_flag_vars": ["CMAKE_CXX_FLAGS"],
+    "cmake_defs": [
+      "CMAKE_C_COMPILER=/usr/lib/llvm-18/bin/clang",
+      "CMAKE_CXX_COMPILER=/usr/lib/llvm-18/bin/clang++",
+      "GMX_SYCL=ACPP",
+      "GMX_GPU=SYCL",
+      "ACPP_TARGETS=cuda:sm_90",
+      "GMX_BUILD_OWN_FFTW=ON",
+      "REGRESSIONTEST_DOWNLOAD=ON",
+      "BUILD_TESTING=OFF"
+    ]
+  },
+  "compiler": "acpp",
+  "runtime_cache_policy": "reuse",
+  "compiler_flags_base": "",
+  "compiler_flags": [
+    "-O2",
+    "-O3"
+  ],
+  "compiler_flag_pool": [
+    "-fno-math-errno",
+    "-ffp-contract=fast",
+    "-ffast-math",
+    "-funroll-loops",
+    "-fno-unroll-loops",
+    "-fstrict-aliasing",
+    "-fno-strict-aliasing",
+    "-mllvm -force-vector-interleave={2,4,8,16}",
+    "-mllvm -enable-loopinterchange",
+    "-fdelete-null-pointer-checks",
+    "-fno-delete-null-pointer-checks",
+    "-fexceptions",
+    "-fno-exceptions",
+    "-fno-rtti"
+  ],
+  "compiler_params": {
+    
+  },
+  "compiler_params_select": {
+    "min": 0,
+    "max": 0,
+    "always": []
+  },
+  "program_args": [
+    "mdrun",
+    "-s",
+    "/cephyr/users/wincenth/Vera/ra/gromacs/SCOuT/runfiles/cubic.tpr",
+    "-deffnm",
+    "scout_gpu_acpp",
+    "-nsteps",
+    "2000",
+    "-ntmpi",
+    "1",
+    "-ntomp",
+    "32",
+    "-pin",
+    "on",
+    "-nb",
+    "gpu",
+    "-pme",
+    "gpu",
+    "-update",
+    "gpu",
+    "-bonded",
+    "gpu"
+  ],
+  "env": {
+    
+  },
+  "objectives": [
+    { "metric": "gmx_ns_per_day", "goal": "max" }
+  ],
+  "search": {
+    "study": "tabu",
+    "random_seed": 17
+  },
+  "tabu": {
+    "max_iters": 32,
+    "max_no_improve": 5,
+    "tabu_tenure": 8,
+    "neighborhood": 4,
+    "allow_variant_moves": true,
+    "allow_param_moves": true,
+    "allow_pool_moves": true,
+    "allow_env_moves": true,
+    "env_mode": "sample",
+    "env_cap": 4,
+    "results_csv": "./tabu_gpu_acpp_verify.csv",
+    "clean_run_outputs": true,
+    "clean_globs": ["mdout.mdp"]
+  },
+  "parser": {
+    "label": "sum",
+    "aggregate": "sum",
+    "run_cwd": "binary_dir",
+    "warmup_runs": 2,
+    "format": "gromacs"
+  },
+  "runs": 5,
+  "csv_log": "./tabu_gpu_acpp_verify_unused.csv",
+  "failed_builds": "./tabu_gpu_acpp_failed_verify.csv"
+}

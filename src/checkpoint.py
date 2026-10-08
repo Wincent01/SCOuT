@@ -148,6 +148,11 @@ def config_fingerprint(cfg: Any, tabu_spec: Any) -> str:
             "env": getattr(tabu_spec, "env", None) or {},
         },
     }
+    # Only include flag constraints when present, so constraint-free configs keep
+    # their existing fingerprints and stay resumable after this change.
+    constraints = getattr(cfg, "flag_constraints", None)
+    if constraints is not None and not getattr(constraints, "is_empty", True):
+        payload["flag_constraints"] = constraints.as_fingerprint()
     return _sha256(payload)[:16]
 
 # RNG helpers

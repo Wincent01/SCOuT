@@ -24,6 +24,8 @@ MetricDict = Dict[str, Number]
 ###############################################################################
 
 from src.misc import _normalize_args
+from src.flag_constraints import FlagConstraints
+from src.logger import LOG
 
 ###############################################################################
 # Data‑classes for strongly‑typed config handling                             #
@@ -467,6 +469,9 @@ class Config:
     # Build/run/runtime statistics CSV (default: ./scout_stats.csv)
     stats_log: Optional[str] = None
 
+    # Declarative rules over flag combinations (exclusive groups / implied flags)
+    flag_constraints: FlagConstraints = dataclasses.field(default_factory=FlagConstraints)
+
     # Wavefront
     wavefront: Optional[WavefrontSpec] = None
     #tabu
@@ -529,6 +534,9 @@ class Config:
             raw.get("compiler_params_select", {}),
             list(compiler_params.keys())
         )
+
+        # Declarative flag constraints (exclusive groups / implied flags)
+        flag_constraints = FlagConstraints.from_dict(raw.get("flag_constraints"))
 
         # Environment space
         env_schema = raw.get("env")
@@ -612,6 +620,15 @@ class Config:
                 "do not identify the runnable file"
             )
 
+        if not flag_constraints.is_empty:
+            raw_flags = raw.get("compiler_flags", []) or []
+            if isinstance(raw_flags, dict):
+                raw_flags = list(raw_flags.values())
+            universe = {str(flag) for flag in raw_flags}
+            universe |= {str(flag) for flag in (raw.get("compiler_flag_pool", []) or [])}
+            for message in flag_constraints.validate_against(universe):
+                LOG.log(f"[config] warning: {message}")
+
         return cls(
             backend=backend,
             source=loaded_source,
@@ -636,6 +653,7 @@ class Config:
             beam_tabu=raw.get("beam_tabu", {}) or {},
             anneal=anneal,
             poly_morph=poly_morph,
+            flag_constraints=flag_constraints,
             runs=runs,
             csv_log=raw.get("csv_log"),
             pareto_log=raw.get("pareto_log"),

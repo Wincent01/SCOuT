@@ -45,15 +45,23 @@ def _complexity_limits(
         return n_params_total, n_pool_total
 
 # --- choose up to pool_cap on/off flags using scores ---
-def _select_pool_flags(trial, pool_flags: list[str], pool_cap: int) -> list[str]:
-    """Pick 0..pool_cap booleans from the pool using scores + a sampled k."""
+def _select_pool_flags(trial, pool_flags: list[str], pool_cap: int,
+                       constraints=None, active=()) -> list[str]:
+    """Pick 0..pool_cap booleans from the pool using scores + a sampled k.
+
+    When ``constraints`` is given, picks that are redundant or mutually
+    exclusive are discarded before the flag string is rendered.
+    """
     if not pool_flags or pool_cap <= 0:
         return []
     k = int(trial.suggest_int("pool_k", 0, min(pool_cap, len(pool_flags))))
     scored = [(float(trial.suggest_float(f"score::pool::{f}", 0.0, 1.0)), f) for f in pool_flags]
     scored.sort(reverse=True)
-    selected = {f for _, f in scored[:k]}
-    return [f for f in pool_flags if f in selected]
+    selected = [f for _, f in scored[:k]]
+    if constraints is not None and not constraints.is_empty:
+        selected = constraints.select_consistent(selected, active)
+    selected_set = set(selected)
+    return [f for f in pool_flags if f in selected_set]
 
 
 
@@ -124,6 +132,7 @@ def suggest_compiler_flags(trial,
                            flag_pool: List[str],
                            compiler_params_select: Optional[Dict[str, Any]] = None,
                            n_startup_trials: int = 10,
+                           constraints: Optional[Any] = None,
                            ) -> Tuple[str, str]:
     
     chosen: List[str] = []
@@ -134,6 +143,7 @@ def suggest_compiler_flags(trial,
     chosen.append(compiler_flags_base)
 
     # ── 1. Variant strings
+    variant: Optional[str] = None
     if variants:
         variant = trial.suggest_categorical("flag_variant", variants)
         chosen.append(variant)
@@ -150,25 +160,33 @@ def suggest_compiler_flags(trial,
     param_keys = list(params_schema.keys())
     active_keys = _select_param_subset(trial, param_keys, compiler_params_select or {}, max_k=param_cap)
 
+    param_flags: List[str] = []
     for opt in active_keys:
         key_for_log, flag = _render_one_param(trial, opt, params_schema[opt])
         chosen.append(flag)
         label_parts.append(key_for_log)
+        param_flags.append(flag)
 
     # ── 3. flag pool
 
     pool_list = list(flag_pool or [])
-    picked_pool = _select_pool_flags(trial, pool_list, pool_cap)
+    if constraints is not None and not constraints.is_empty:
+        # Everything the base, variant and params already activate (for implies).
+        active_flags = [tok for tok in shlex.split(compiler_flags_base or "") if tok]
+        if variant:
+            active_flags.append(variant)
+        active_flags.extend(param_flags)
+        pool_list = constraints.prune_pool(pool_list, active_flags)
+    else:
+        active_flags = []
+
+    picked_pool = _select_pool_flags(
+        trial, pool_list, pool_cap,
+        constraints=constraints, active=active_flags,
+    )
     for f in picked_pool:
         chosen.append(f)
         label_parts.append(f)
-
-
-    #for flag in flag_pool:
-    #    use_it = trial.suggest_categorical(flag, [0, 1])
-    #    if use_it:
-    #        chosen.append(flag)
-    #        label_parts.append(flag)
 
     flag_str  = " ".join(chosen)
     pretty_id = "|".join(chosen) or "default"

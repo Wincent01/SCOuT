@@ -234,6 +234,42 @@ def _render_flags(
     return flags_key, flags_str
 
 
+def _active_flag_strings(
+    cfg: Config,
+    variant: Optional[str],
+    params_choice: Dict[str, Any],
+) -> List[str]:
+    """Exact flag strings a state activates (variant + rendered compiler params)."""
+    active: List[str] = []
+    if variant:
+        active.append(variant)
+    for opt, spec in (cfg.compiler_params or {}).items():
+        if opt not in params_choice:
+            continue
+        val = params_choice[opt]
+        if "{}" in opt:
+            active.append(opt.format(val))
+        elif isinstance(spec, dict) and "sep" in spec:
+            active.append(f"{opt}{spec.get('sep', '=')}{val}")
+        else:
+            active.append(f"{opt}={val}")
+    return active
+
+
+def _sanitize_pool(
+    cfg: Config,
+    variant: Optional[str],
+    params_choice: Dict[str, Any],
+    pool_list: Sequence[str],
+) -> List[str]:
+    """Drop pool flags made redundant or conflicting by the variant/params."""
+    constraints = getattr(cfg, "flag_constraints", None)
+    if constraints is None or constraints.is_empty:
+        return list(pool_list)
+    active = _active_flag_strings(cfg, variant, params_choice)
+    return constraints.sanitize_pool(active, list(pool_list))
+
+
 # -----------------------------
 # Neighborhood moves
 def _neighbors(
@@ -250,6 +286,8 @@ def _neighbors(
     variants_all: List[str] = list(cfg.compiler_flags or [])
     params_schema = cfg.compiler_params or {}
     always = set((cfg.compiler_params_select or {}).get("always", []))
+    constraints = getattr(cfg, "flag_constraints", None)
+    active_now = _active_flag_strings(cfg, variant, params_choice)
 
     # Helper to get domain of a param
     def _values_for_param(key: str) -> List[Any]:
@@ -263,7 +301,9 @@ def _neighbors(
         cand_variants = [v for v in variants_all if v != variant]
         rng.shuffle(cand_variants)
         for nv in cand_variants:
-            neigh.append((nv, dict(params_choice), list(pool_list), dict(env_dict)))
+            # A different variant may make some pool flags redundant/conflicting.
+            npool = _sanitize_pool(cfg, nv, params_choice, pool_list)
+            neigh.append((nv, dict(params_choice), npool, dict(env_dict)))
 
     # ---- PARAM NEIGHBORS (add/remove/change/swap) ----
     if tabu.allow_param_moves and params_schema:
@@ -323,8 +363,16 @@ def _neighbors(
     # ---- POOL NEIGHBORS (add/remove single flag) ----
     if tabu.allow_pool_moves and pool_all:
         s = set(pool_list)
-        # ADD flags not present
-        addables = [f for f in pool_all if f not in s]
+        # ADD flags not present (skip those that conflict with or duplicate the
+        # current context, or that would make an active flag redundant)
+        addables: List[str] = []
+        for f in pool_all:
+            if f in s:
+                continue
+            if constraints is not None and not constraints.is_empty:
+                if not constraints.can_add(f, active_now + list(pool_list)):
+                    continue
+            addables.append(f)
         rng.shuffle(addables)
         for f in addables:
             new_pool = sorted(s | {f})
@@ -348,6 +396,9 @@ def _neighbors(
     rng.shuffle(neigh)  # randomize before slicing
 
     for nv, nparams, npool, nenv in neigh:
+        if constraints is not None and not constraints.is_empty:
+            if not constraints.is_allowed(_active_flag_strings(cfg, nv, nparams) + list(npool)):
+                continue
         key = (
             nv,
             tuple(sorted(nparams.items())),
@@ -531,6 +582,10 @@ def run_tabu_study(
                     continue
                 params_choice[k] = rng.choice(vals)
         env = dict(env_list[0]) if env_list else {}
+
+    # Restored states may predate a constraint change: drop anything now
+    # redundant or conflicting before the baseline is evaluated.
+    pool_list = _sanitize_pool(cfg, variant, params_choice, pool_list)
 
     phase = str(state.get("phase") or ("search" if started else "baseline"))
     iters_done = int(state.get("iteration", 0) or 0)

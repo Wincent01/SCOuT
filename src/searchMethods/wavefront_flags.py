@@ -491,6 +491,12 @@ def run_wavefront_study(cfg: Config) -> None:
         ([cfg.compiler_flags_base] if cfg.compiler_flags_base else []) + list(params.base_flags or [])
     ))
 
+    constraints = getattr(cfg, "flag_constraints", None)
+    if constraints is not None and not constraints.is_empty:
+        # Atoms already implied by the baseline are redundant to test on their own.
+        redundant = constraints.implied_flags(base_flags)
+        atoms = [a for a in atoms if a not in redundant]
+
     # Baseline
     print("[wavefront] evaluating baseline …")
     base_dir = workroot / "k00_baseline"
@@ -545,6 +551,11 @@ def run_wavefront_study(cfg: Config) -> None:
             #gen_iter = _generate_beam(prev_top, atoms)
             gen_iter = _generate_beam_boost(prev_top, atoms, rng, focus_count=1)
         candidates = list(gen_iter)
+        if constraints is not None and not constraints.is_empty:
+            candidates = [
+                c for c in candidates
+                if constraints.is_allowed(list(base_flags) + list(c))
+            ]
         if params.per_wave_cap and len(candidates) > params.per_wave_cap:
             rng.shuffle(candidates)
             candidates = candidates[: params.per_wave_cap]

@@ -123,6 +123,46 @@ For a single source, use `"source": "path/to/file.cpp"` instead of `project`.
 
 Conditional environment variables must appear after every variable referenced by `when`. SCOuT removes managed-but-inactive variables from the inherited process environment, preventing shell settings from leaking into a candidate.
 
+### Flag constraints
+
+Searches that combine compiler flags can waste evaluations on combinations that cancel each other
+out or repeat a flag an optimization level already enables. Declare those rules once in a top-level
+`flag_constraints` block:
+
+```json
+"flag_constraints": {
+  "exclusive": [
+    ["-funroll-loops", "-fno-unroll-loops"],
+    ["-fstrict-aliasing", "-fno-strict-aliasing"],
+    ["-fexceptions", "-fno-exceptions"]
+  ],
+  "implies": {
+    "-ffast-math": ["-fno-math-errno", "-ffp-contract=fast"],
+    "-O2": ["-fstrict-aliasing", "-fdelete-null-pointer-checks", "-fexceptions"],
+    "-O3": ["-fstrict-aliasing", "-fdelete-null-pointer-checks", "-fexceptions", "-funroll-loops"]
+  }
+}
+```
+
+- `exclusive` lists groups of which **at most one** flag may be active at a time. The search never
+  emits a configuration containing two members of the same group.
+- `implies` maps an active flag (a `compiler_flags` entry such as `-O3`, or a pool flag such as
+  `-ffast-math`) to the flags it already enables. Those flags are **redundant** and are dropped while
+  the source flag is active. The relation is applied transitively.
+
+Flags are matched by exact string equality against entries of `compiler_flags` and
+`compiler_flag_pool` (and rendered `compiler_params`). Referencing a flag that is not in the space
+only logs a warning.
+
+`implies` is removal-only: an implied flag is dropped, but it is *not* treated as active. This keeps
+override experiments testable — with `-O3` implying `-funroll-loops`, `-O3 -funroll-loops` is
+redundant and skipped while `-O3 -fno-unroll-loops` is still explored.
+
+Enforcement covers `tabu` and `optuna`; `anneal`, `beam_tabu` and `wavefront` apply the same rules
+on a best-effort basis. The rules are part of the tabu resume fingerprint, so changing them
+invalidates an existing `--resume` checkpoint. The flags implied by `-O2`/`-O3` are
+compiler-specific — confirm the mapping against your toolchain.
+
 ## Build and AdaptiveCpp cache reuse
 
 SCOuT caches these separately:
@@ -167,11 +207,65 @@ Example search selection:
   "neighborhood": 16,
   "env_mode": "sample",
   "env_cap": 8,
-  "results_csv": "/tmp/scout/tabu.csv"
+  "results_csv": "/tmp/scout/tabu.csv",
+  "state_file": "/tmp/scout/tabu.state.json",
+  "clean_run_outputs": true,
+  "clean_globs": ["mdout.mdp"]
 }
 ```
 
+`results_csv`, `state_file`, `failure_csv`, `run_dir`, `clean_run_outputs` and `clean_globs` control
+the durable run record described under [Resuming a tabu run](#resuming-a-tabu-run); the remaining keys
+shape the search itself.
+
 Unknown study and sampler names are configuration errors. CMA-ES is not offered because SCOuT's flag and environment dimensions are categorical; use TPE, random sampling, or NSGA-III.
+
+## Resuming a tabu run
+
+Tabu is built for clusters where a single job cannot hold the whole search. It writes every
+completed measurement to the results CSV immediately and snapshots its search state after each
+completed iteration, so an interrupted run (walltime kill, node failure, `Ctrl-C`) can be continued
+instead of restarted.
+
+| File | Purpose |
+| --- | --- |
+| `<results_csv>` | Every measured configuration: `k`, objective metrics, `compiler_flags`, `env`, `binary`, `eval_id`, `flags`, `compile_key`, `cached`, plus one column per extra metric. Appended and flushed per measurement. |
+| `<results_csv>.state.json` | Atomic snapshot of the search: current configuration, tabu memory, best result, iteration and no-improvement counters, RNG state, sampled environment list, phase. |
+| `failed_builds` (or `tabu.failure_csv`) | Configurations that failed to build or measure, with the reason. Skipped on later attempts. |
+| `<results_csv>.archive-<timestamp>/` | Previous CSV, state and failures, moved aside when a new run starts. |
+
+CLI options:
+
+```bash
+python3 main.py --mode parameter_tuning --config configs/flag-env/tabu_gromacs_cpu_omp.json \
+  --trials 1 --iters 40 --budget lifetime
+```
+
+- `--resume` continues the run recorded in the configured results CSV. Without it, a new run starts and any earlier files are archived rather than overwritten.
+- `--fresh` states that intent explicitly (it is the default).
+- `--iters N` overrides `tabu.max_iters`.
+- `--budget lifetime` (default) treats `N` as the total number of iterations the run may perform across all restarts; `--budget per-run` grants `N` additional iterations on top of the completed ones.
+- `--workroot DIR` chooses where builds and run scratch live, defaulting to `$SCOUT_TABU_WORKROOT`, then `tabu.run_dir`, then `$TMPDIR/SCOuT_tabu`.
+
+Submit, get killed, resubmit:
+
+```bash
+#SBATCH -t 01:00:00
+python3 main.py --mode parameter_tuning --config configs/flag-env/tabu_gromacs_cpu_omp.json \
+  --trials 1 --iters 40 --resume
+```
+
+What is reused on resume:
+
+- Configurations already in the results CSV are never built or measured again; their recorded metrics are restored as the search state.
+- Recorded failures are skipped, so a configuration that cannot build does not consume job time twice.
+- Build artifacts in the workroot are reused when they are still there. Nothing is assumed to survive: if the workroot was wiped (a different node, a cleaned `$TMPDIR`), those configurations are rebuilt from scratch while the recorded results still come from the CSV.
+- `tabu.clean_run_outputs` (default `true`) removes leftover program outputs named after `-deffnm` before re-measuring a configuration, which is what lets an interrupted measurement be repeated when the program refuses to overwrite its own output. Add extra patterns with `tabu.clean_globs`.
+
+Resume is refused when the configuration no longer matches the checkpoint (compiler, flags, params,
+pool, environment schema, objectives, program arguments, build settings, or the tabu move options).
+Iteration limits, tenure and neighborhood are deliberately excluded so budgets can be adjusted
+between restarts.
 
 ## Measurement backends
 
@@ -199,9 +293,14 @@ LIKWID metric names in `objectives` must also be present in `likwid.metrics`.
 
 - `csv_log`: completed evaluation rows.
 - `pareto_log`: current Pareto front for multi-objective Optuna studies.
-- `failed_builds`: failed and pruned Optuna trials with their reason.
+- `failed_builds`: failed and pruned Optuna trials with their reason; also the tabu failure log.
 - `sqlite_log`: persistent Optuna study database, written during optimization.
 
-Parent directories are created automatically. If a CSV already exists, SCOuT creates a timestamped filename instead of overwriting it.
+Parent directories are created automatically. For Optuna and wavefront, a CSV that already exists
+triggers a timestamped filename instead of an overwrite. Tabu keeps the configured filename stable,
+because the results CSV doubles as its resume record; see
+[Resuming a tabu run](#resuming-a-tabu-run) for how earlier files are archived.
 
-Temporary build artifacts and logs are printed at startup, normally under `/tmp/SCOuT_*`.
+Temporary build artifacts and logs are printed at startup, normally under `/tmp/SCOuT_*`. For tabu
+the location is stable across restarts (`$TMPDIR/SCOuT_tabu` unless overridden), which is what allows
+previously built binaries to be reused while they are still on disk.

@@ -46,6 +46,22 @@
     "-mllvm -force-vector-interleave={2,4,8,16}",
     "-mllvm -enable-loopinterchange"
   ],
+  "flag_constraints": {
+    "exclusive": [
+      ["-fvectorize", "-fno-vectorize"],
+      ["-fslp-vectorize", "-fno-slp-vectorize"],
+      ["-funroll-loops", "-fno-unroll-loops"],
+      ["-fstrict-aliasing", "-fno-strict-aliasing"],
+      ["-fmerge-all-constants", "-fno-merge-all-constants"],
+      ["-fdelete-null-pointer-checks", "-fno-delete-null-pointer-checks"],
+      ["-fexceptions", "-fno-exceptions"]
+    ],
+    "implies": {
+      "-ffast-math": ["-fno-math-errno", "-ffp-contract=fast"],
+      "-O2": ["-fstrict-aliasing", "-fdelete-null-pointer-checks", "-fexceptions", "-fslp-vectorize"],
+      "-O3": ["-fstrict-aliasing", "-fdelete-null-pointer-checks", "-fexceptions", "-fslp-vectorize", "-fvectorize"]
+    }
+  },
   "compiler_params": {
     "-march": ["native", "znver4"],
     "-mprefer-vector-width": [128, 256]

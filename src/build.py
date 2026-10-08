@@ -230,7 +230,21 @@ def compile_project(cfg: BuildProject, compiler: str, flags: str, workdir: Path,
         if clean.returncode:
             _save_log(workdir, trial, "make_clean", clean)
             return None
-        build_cmd = ["make", f"CXX={compiler}"]
+
+        # Remove a previously built, explicitly declared target. The project's own
+        # clean target may not remove it, and because compiler flags are passed as
+        # make variables (not file changes), make could otherwise treat the old
+        # binary as up to date and hand back a previous run's artifact.
+        stale = _declared_executable_path(cfg, cfg.dir)
+        if stale is not None and (stale.is_file() or stale.is_symlink()):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
+        # ``--always-make`` forces recompilation/relinking regardless of timestamps,
+        # so the returned binary always reflects this configuration's flags.
+        build_cmd = ["make", "--always-make", f"CXX={compiler}"]
         if cfg.build_jobs and cfg.build_jobs > 0:
             build_cmd.append(f"-j{cfg.build_jobs}")
         else:
@@ -255,6 +269,19 @@ def compile_project(cfg: BuildProject, compiler: str, flags: str, workdir: Path,
         return binary
 
     raise ValueError(f"unknown build_system '{cfg.build_system}'")
+
+def _declared_executable_path(cfg: BuildProject, build_root: Path) -> Optional[Path]:
+    """Path of the explicitly configured executable/target, or None.
+
+    Unlike :func:`_resolve_project_executable` this never searches the build tree,
+    so it is safe to use for deleting a specific, configured artifact.
+    """
+    if cfg.executable:
+        return cfg.executable if cfg.executable.is_absolute() else build_root / cfg.executable
+    if cfg.target:
+        return build_root / cfg.target
+    return None
+
 
 def _resolve_project_executable(cfg: BuildProject, build_root: Path) -> Optional[Path]:
     """Resolve the runnable artifact independently from the build target name."""

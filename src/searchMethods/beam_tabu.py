@@ -149,16 +149,22 @@ def _compile_and_measure(evaluator: Evaluator, cfg: Config, flags: Sequence[str]
 def _canonical(flags: Iterable[str]) -> Tuple[str, ...]:
     return tuple(sorted(dict.fromkeys(flags)))
 
-def _neighbors(parent: Tuple[str,...], atoms: List[str], max_k: int, allow_add: bool, allow_del: bool, limit: int) -> List[Tuple[str,...]]:
+def _neighbors(parent: Tuple[str,...], atoms: List[str], max_k: int, allow_add: bool, allow_del: bool, limit: int,
+               constraints=None, base_flags: Sequence[str] = ()) -> List[Tuple[str,...]]:
     present = set(parent)
     additions: List[Tuple[str,...]] = []
     deletions: List[Tuple[str,...]] = []
 
     # add moves
     if allow_add and len(parent) < max_k:
+        active = list(base_flags) + list(parent)
         for a in atoms:
-            if a not in present:
-                additions.append(_canonical(parent + (a,)))
+            if a in present:
+                continue
+            if constraints is not None and not constraints.is_empty:
+                if not constraints.can_add(a, active):
+                    continue
+            additions.append(_canonical(parent + (a,)))
     # delete moves
     if allow_del and len(parent) > 0:
         for a in parent:
@@ -203,6 +209,7 @@ def run_beam_tabu_study(cfg: Config) -> None:
     
     evaluator = Evaluator(cfg, workroot)
     atoms = _collect_atoms(cfg, bt)
+    constraints = getattr(cfg, "flag_constraints", None)
     metric_name, goal = _choose_objective(cfg)
     sig = cfg.significance
     MIN_REL = sig.min_rel_gain
@@ -263,7 +270,8 @@ def run_beam_tabu_study(cfg: Config) -> None:
         for parent_atoms in beam:
             # Full current flags = base + parent_atoms
             parent_flags = list(base) + list(parent_atoms)
-            neigh = _neighbors(parent_atoms, atoms, bt.max_k, tb.allow_add_moves, tb.allow_del_moves, tb.neighborhood)
+            neigh = _neighbors(parent_atoms, atoms, bt.max_k, tb.allow_add_moves, tb.allow_del_moves, tb.neighborhood,
+                               constraints=constraints, base_flags=list(base))
             # Optional cap per iteration for cost control
             if bt.per_iter_cap and len(neigh) > bt.per_iter_cap:
                 rng.shuffle(neigh); neigh = neigh[:bt.per_iter_cap]

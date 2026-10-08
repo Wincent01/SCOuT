@@ -231,6 +231,58 @@ class TabuResumeTests(unittest.TestCase):
         self.assertLess(state["iteration"], 20)
         self.assertTrue((self.root / "tabu.state.json").is_file())
 
+    def test_flag_constraints_prevent_conflicting_pool_flags(self):
+        cfg = self.load(
+            compiler_flag_pool=["-funroll-loops", "-fno-unroll-loops"],
+            flag_constraints={"exclusive": [["-funroll-loops", "-fno-unroll-loops"]]},
+            tabu={
+                "max_iters": 8, "max_no_improve": 20, "tabu_tenure": 4,
+                "neighborhood": 6, "allow_variant_moves": False,
+                "allow_param_moves": False, "allow_pool_moves": True,
+                "allow_env_moves": False, "env_mode": "fixed", "env": {},
+                "results_csv": str(self.root / "tabu.csv"),
+            },
+        )
+        self.run_study(cfg, iters=8)
+        rows = self.read_rows()
+        self.assertTrue(rows)
+        for row in rows:
+            tokens = set((row["compiler_flags"] or "").split("|"))
+            self.assertFalse(
+                {"-funroll-loops", "-fno-unroll-loops"} <= tokens,
+                row["compiler_flags"],
+            )
+
+    def test_flag_constraints_drop_flags_implied_by_variant(self):
+        cfg = self.load(
+            compiler_flags=["-O3"],
+            compiler_flag_pool=["-funroll-loops", "-fno-unroll-loops"],
+            flag_constraints={"implies": {"-O3": ["-funroll-loops"]}},
+            tabu={
+                "max_iters": 4, "max_no_improve": 20, "tabu_tenure": 4,
+                "neighborhood": 6, "allow_variant_moves": True,
+                "allow_param_moves": False, "allow_pool_moves": True,
+                "allow_env_moves": False, "env_mode": "fixed", "env": {},
+                "results_csv": str(self.root / "tabu.csv"),
+            },
+        )
+        self.run_study(cfg, iters=4)
+        rows = self.read_rows()
+        self.assertTrue(rows)
+        for row in rows:
+            tokens = set((row["compiler_flags"] or "").split("|"))
+            self.assertIn("-O3", tokens)
+            self.assertNotIn("-funroll-loops", tokens)
+
+    def test_resume_refuses_changed_flag_constraints(self):
+        self.run_study(
+            self.load(flag_constraints={"exclusive": [["-funroll-loops", "-fno-unroll-loops"]]}),
+            iters=1,
+        )
+        changed = self.load(flag_constraints={"exclusive": [["-ffast-math", "-fno-fast-math"]]})
+        with self.assertRaises(SystemExit):
+            self.run_study(changed, resume=True, iters=2)
+
     def test_invalid_budget_is_rejected(self):
         with self.assertRaises(ValueError):
             self.run_study(self.load(), iters=1, budget="forever")

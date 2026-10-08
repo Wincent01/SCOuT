@@ -136,6 +136,7 @@ def explore_optuna(cfg: Config, n_trials: int) -> None:
                             cfg.compiler_flag_pool,
                             cfg.compiler_params_select,
                             complexity_startup,
+                            constraints=cfg.flag_constraints,
                         )
         trial.set_user_attr("compiler_flags_str", flags)  
 

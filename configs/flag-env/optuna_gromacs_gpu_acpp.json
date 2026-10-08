@@ -22,30 +22,24 @@
   "runtime_cache_policy": "reuse",
   "compiler_flags_base": "",
   "compiler_flags": [
-    "-O3",
-    "-O2"
+    "-O2",
+    "-O3"
   ],
   "compiler_flag_pool": [
     "-fno-math-errno",
     "-ffp-contract=fast",
     "-ffast-math",
-    "-fvectorize",
-    "-fno-vectorize",
-    "-fslp-vectorize",
-    "-fno-slp-vectorize",
     "-funroll-loops",
     "-fno-unroll-loops",
     "-fstrict-aliasing",
     "-fno-strict-aliasing",
-    "-fmerge-all-constants",
-    "-fno-merge-all-constants",
+    "-mllvm -force-vector-interleave={2,4,8,16}",
+    "-mllvm -enable-loopinterchange",
     "-fdelete-null-pointer-checks",
     "-fno-delete-null-pointer-checks",
     "-fexceptions",
     "-fno-exceptions",
-    "-fno-rtti",
-    "-mllvm -force-vector-interleave={2,4,8,16}",
-    "-mllvm -enable-loopinterchange"
+    "-fno-rtti"
   ],
   "compiler_params": {
     "-march": ["native", "znver4"],

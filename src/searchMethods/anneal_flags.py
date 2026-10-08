@@ -101,6 +101,29 @@ def _render_flags(
     flags_key = "|".join(parts) if parts else "default"
     return flags_key, flags_str
 
+
+def _active_flag_strings(
+    cfg: Config,
+    variant: Optional[str],
+    params_choice: Dict[str, Any],
+) -> List[str]:
+    """Exact flag strings a state activates (variant + rendered compiler params)."""
+    active: List[str] = []
+    if variant:
+        active.append(variant)
+    for opt, spec in (getattr(cfg, "compiler_params", {}) or {}).items():
+        if opt not in params_choice:
+            continue
+        val = params_choice[opt]
+        if "{}" in opt:
+            active.append(opt.format(val))
+        elif isinstance(spec, dict) and "sep" in spec:
+            active.append(f"{opt}{spec.get('sep', '=')}{val}")
+        else:
+            active.append(f"{opt}={val}")
+    return active
+
+
 # ---------- Build & measure ----------
 def _compile_and_measure(evaluator: Evaluator, cfg: Config, flags_str: str, env: Dict[str, str], work: Path) -> Tuple[float, MetricDict, str]:
     evaluation = evaluator.evaluate(flags_str, env, work)
@@ -183,6 +206,8 @@ def _neighbors_sa(
     pool_all: List[str]     = list(cfg.compiler_flag_pool or [])
     params_schema           = cfg.compiler_params or {}
     always = set((cfg.compiler_params_select or {}).get("always", []))
+    constraints = getattr(cfg, "flag_constraints", None)
+    active_variant_params = _active_flag_strings(cfg, variant, params_choice)
 
     out: List[Tuple[Optional[str], Dict[str, Any], List[str]]] = []
 
@@ -194,7 +219,12 @@ def _neighbors_sa(
         choices = [v for v in variants_all if v != variant]
         if not choices: return
         nv = rng.choice(choices)
-        out.append((nv, dict(params_choice), list(pool_list)))
+        new_pool = list(pool_list)
+        if constraints is not None and not constraints.is_empty:
+            new_pool = constraints.sanitize_pool(
+                _active_flag_strings(cfg, nv, params_choice), pool_list
+            )
+        out.append((nv, dict(params_choice), new_pool))
 
     def move_param():
         if not params_schema: return
@@ -252,8 +282,15 @@ def _neighbors_sa(
             rem = rng.choice(list(new_pool)); new_pool.remove(rem)
         else:
             cand = rng.choice(pool_all)
-            if cand in new_pool: new_pool.remove(cand)
-            else: new_pool.add(cand)
+            if cand in new_pool:
+                new_pool.remove(cand)
+            elif constraints is None or constraints.is_empty or constraints.can_add(
+                cand, active_variant_params + list(pool_list)
+            ):
+                new_pool.add(cand)
+            elif new_pool:
+                # Adding `cand` is illegal: fall back to removing one instead.
+                new_pool.remove(rng.choice(list(new_pool)))
         out.append((variant, dict(params_choice), sorted(new_pool)))
 
     moves = []

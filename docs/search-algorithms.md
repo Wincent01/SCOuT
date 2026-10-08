@@ -38,6 +38,9 @@ Code: [src/searchMethods/tabu_flags.py](/home/hari/git/SCOuT/src/searchMethods/t
 - Local search with memory to avoid cycling
 - Can move across variants, params, pool flags, and environment choices
 - Useful when full enumeration is too expensive
+- Persists every measurement to its results CSV and snapshots its state after each iteration, so an
+  interrupted run can be continued with `--resume`.
+- Reuses recorded results and on-disk build artifacts instead of repeating work
 
 ### Beam-Tabu
 
