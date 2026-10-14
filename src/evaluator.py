@@ -281,6 +281,7 @@ class Evaluator:
             if self.cfg.backend == "perf":
                 metrics = measure_perf(
                     self.cfg.perf, binary, self.cfg.program_args, env, self.cfg.runs,
+                    workdir=run_workdir, project=self.cfg.project,
                     clear_runtime_cache=clear_runtime, managed_env_keys=managed_keys,
                 )
             elif self.cfg.backend == "parser":
@@ -292,6 +293,7 @@ class Evaluator:
             else:
                 metrics = measure_likwid(
                     self.cfg.likwid, binary, self.cfg.program_args, env, self.cfg.runs,
+                    workdir=run_workdir, project=self.cfg.project,
                     clear_runtime_cache=clear_runtime, managed_env_keys=managed_keys,
                 )
 

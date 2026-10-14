@@ -68,6 +68,8 @@ def measure_perf(
     prog_args: List[str],
     env: EnvMap,
     runs: int = 1,
+    workdir: Optional[Path] = None,
+    project: Optional[BuildProject] = None,
     *,
     clear_runtime_cache: bool = True,
     managed_env_keys: Sequence[str] = (),
@@ -75,12 +77,13 @@ def measure_perf(
     meas_runs = max(1, runs)
     total_runs = cfg.warmup_runs + meas_runs
     buckets: Dict[str, List[Number]] = {e: [] for e in cfg.events + ["CPI"]}
+    cwd = resolve_run_cwd(getattr(cfg, "run_cwd", "process"), bin_path, workdir, project)
 
     for i in range(total_runs):
         cmd = ["perf", "stat", "-e", ",".join(cfg.events), "--", str(bin_path), *prog_args]
         if cfg.core_list:
             cmd = ["taskset", "-c", cfg.core_list, *cmd]
-        proc = _run(cmd, env=_measurement_env(env, managed_env_keys))
+        proc = _run(cmd, cwd=cwd, env=_measurement_env(env, managed_env_keys))
         if proc.returncode != 0:
             raise RuntimeError(f"perf/program exited with rc={proc.returncode}: {(proc.stderr or '')[-1200:]}")
 
@@ -179,6 +182,8 @@ def measure_likwid(
     prog_args: List[str],
     env: EnvMap,
     runs: int = 1,
+    workdir: Optional[Path] = None,
+    project: Optional[BuildProject] = None,
     *,
     clear_runtime_cache: bool = True,
     managed_env_keys: Sequence[str] = (),
@@ -191,6 +196,7 @@ def measure_likwid(
     
     meas_runs = max(1, runs)
     total_runs = cfg.warmup_runs + meas_runs
+    cwd = resolve_run_cwd(getattr(cfg, "run_cwd", "process"), bin_path, workdir, project)
 
     for i in range(total_runs):
         cmd = ["likwid-perfctr"]
@@ -204,7 +210,7 @@ def measure_likwid(
             cmd += ["-g", ",".join(cfg.events)]
         cmd += [str(bin_path), *prog_args]
 
-        proc = _run(cmd, env=_measurement_env(env, managed_env_keys))
+        proc = _run(cmd, cwd=cwd, env=_measurement_env(env, managed_env_keys))
         if proc.returncode != 0:
             text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
             raise RuntimeError(f"LIKWID/program exited with rc={proc.returncode}: {text[-1200:]}")
@@ -244,10 +250,37 @@ _GROMACS_PERF_RE = re.compile(
     re.IGNORECASE,
 )
 
+def resolve_run_cwd(
+    run_cwd: Optional[str],
+    bin_path: Path,
+    workdir: Optional[Path] = None,
+    project: Optional[BuildProject] = None,
+) -> Optional[Path]:
+    """
+    Working directory for a measured program.
+
+    ``process``/``cwd`` (the perf/likwid default) returns ``None`` so the child
+    inherits SCOuT's working directory, preserving the historical behaviour.
+    ``binary_dir`` returns the directory holding the executable (the parser
+    backend's default), ``project_dir`` the configured project directory and
+    ``workdir`` the per-evaluation scratch directory. An unknown value falls
+    back to ``binary_dir``.
+    """
+    mode = str(run_cwd if run_cwd is not None else "process").strip().lower()
+    if mode in {"", "process", "cwd", "inherit"}:
+        return None
+    if mode == "workdir":
+        return Path(workdir) if workdir is not None else Path(bin_path).parent
+    if mode == "project_dir":
+        return Path(project.dir) if project is not None else Path(bin_path).parent
+    # "binary_dir" and anything unrecognised
+    return Path(bin_path).parent
+
+
 def _resolve_cwd(run_cwd: str, bin_path: Path, workdir: Optional[Path], project: Optional[BuildProject]) -> Path:
-    if run_cwd == "workdir" and workdir: return workdir
-    if run_cwd == "project_dir" and project: return project.dir
-    return bin_path.parent
+    """Parser resolver: always returns a concrete directory (never ``None``)."""
+    resolved = resolve_run_cwd(run_cwd, bin_path, workdir, project)
+    return resolved if resolved is not None else Path(bin_path).parent
 
 def _aggregate(vals: List[float], how: str) -> float:
     how = how.lower()

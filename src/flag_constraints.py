@@ -201,6 +201,46 @@ class FlagConstraints:
         redundant = self.implied_flags(active)
         return [flag for flag in pool if flag not in redundant]
 
+    def expand_pool(self, pool: Sequence[str]) -> List[str]:
+        """
+        Return ``pool`` plus any exclusive-group member it does not already list.
+
+        Members of an ``exclusive`` group are implicitly part of the flag space,
+        so they do not have to be repeated in ``compiler_flag_pool``. This does
+        **not** apply to ``implies`` values, which must be listed explicitly.
+        """
+        seen: set = set()
+        out: List[str] = []
+        for flag in pool:
+            if flag not in seen:
+                seen.add(flag)
+                out.append(flag)
+        for group in self.exclusive_groups:
+            for flag in sorted(group):
+                if flag not in seen:
+                    seen.add(flag)
+                    out.append(flag)
+        return out
+
+    def effective_signature(self, flags: Sequence[str]) -> Tuple[str, ...]:
+        """
+        Order-preserving canonical form of a flag list with implied flags removed.
+
+        Two flag lists with the same signature describe the same effective
+        compiler configuration, so a search may reuse the earlier result.
+
+        Only the transitive ``implies`` relation is applied. Exclusive groups are
+        deliberately **not** resolved here: silently dropping one member of a
+        conflicting pair would collapse a configuration the caller asked for into
+        a different one, which could make the search skip a genuinely distinct
+        node. Conflicting combinations are prevented where they are generated.
+        """
+        ordered = list(dict.fromkeys(flags))
+        if not self.implies:
+            return tuple(ordered)
+        redundant = self.implied_flags(ordered)
+        return tuple(flag for flag in ordered if flag not in redundant)
+
     def sanitize(self, flags: Sequence[str]) -> List[str]:
         """
         Remove redundant flags and surplus members of exclusive groups.
@@ -235,6 +275,35 @@ class FlagConstraints:
         cleaned = self.sanitize(list(active) + list(pool))
         active_set = set(active)
         return [flag for flag in cleaned if flag not in active_set]
+
+    def can_add_exclusive(self, flag: str, active: Iterable[str]) -> bool:
+        """
+        True if ``flag`` may be added without breaking an exclusive group.
+
+        Unlike :meth:`can_add` this ignores ``implies``. An implied flag is a
+        legal (if redundant) node whose result is reused through equivalence
+        detection rather than removed from the search space.
+        """
+        if flag in set(active):
+            return False
+        return not self.conflicts(flag, active)
+
+    def sanitize_exclusive(self, flags: Sequence[str]) -> List[str]:
+        """
+        Keep at most one member per exclusive group, leaving implied flags in
+        place. Used where redundant nodes are allowed to stay traversable.
+        """
+        ordered = list(dict.fromkeys(flags))
+        if not self.exclusive_groups:
+            return ordered
+        kept: List[str] = []
+        context: set = set()
+        for flag in ordered:
+            if self.conflicts(flag, context):
+                continue
+            kept.append(flag)
+            context.add(flag)
+        return kept
 
     def is_allowed(self, flags: Sequence[str]) -> bool:
         """True if ``flags`` contains no conflicts and no redundancy."""

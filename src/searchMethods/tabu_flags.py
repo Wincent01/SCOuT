@@ -48,6 +48,10 @@ class TabuSpec:
     max_iters: int = 200
     max_no_improve: int = 50
 
+    # Stop after this many consecutive nodes whose result was reused because the
+    # configuration was equivalent to a previously measured one.
+    max_skips: int = 50
+
     # Tabu list length (tenure)
     tabu_tenure: int = 20
 
@@ -191,9 +195,15 @@ def _render_flags(
     variant: Optional[str],
     params_choice: Dict[str, Any],
     pool_set: Sequence[str],
-) -> Tuple[str, str]:
+) -> Tuple[str, str, List[str]]:
     """
-    Return (flags_key_for_csv, flags_shell_string).
+    Return (flags_key_for_csv, flags_shell_string, flag_entries).
+
+    ``flag_entries`` lists the individual flag *entries* (base, variant, params
+    and pool items) exactly as configured. Entries are opaque: a pool item such
+    as ``-mllvm -enable-loop-flatten`` contains a space, so the rendered string
+    must never be re-split on whitespace to recover them.
+
     params_choice: { "-march": "native", "-mllvm -force-vector-interleave": 4, ... }
     """
     parts: List[str] = []
@@ -231,7 +241,7 @@ def _render_flags(
     # Optuna-like pretty ID: join the *actual* fragments with |
     # (we prefer using parts, not label_parts, so base flags are present in the key)
     flags_key = "|".join(parts) if parts else "default"
-    return flags_key, flags_str
+    return flags_key, flags_str, parts
 
 
 def _active_flag_strings(
@@ -262,12 +272,37 @@ def _sanitize_pool(
     params_choice: Dict[str, Any],
     pool_list: Sequence[str],
 ) -> List[str]:
-    """Drop pool flags made redundant or conflicting by the variant/params."""
+    """Drop pool flags that clash within an exclusive group.
+
+    Implied flags are deliberately kept: they stay traversable nodes whose result
+    is reused by equivalence detection instead of being pruned away.
+    """
     constraints = getattr(cfg, "flag_constraints", None)
     if constraints is None or constraints.is_empty:
         return list(pool_list)
     active = _active_flag_strings(cfg, variant, params_choice)
-    return constraints.sanitize_pool(active, list(pool_list))
+    combined = constraints.sanitize_exclusive(active + list(pool_list))
+    active_set = set(active)
+    return [flag for flag in combined if flag not in active_set]
+
+
+def _effective_signature(cfg: Config, flag_entries: Sequence[str]) -> Tuple[str, ...]:
+    """
+    Canonical signature of a list of flag *entries*.
+
+    Entries are opaque: a pool item such as ``-mllvm -enable-loop-flatten``
+    contains a space and must never be split on whitespace. Splitting would make
+    the repeated ``-mllvm`` look like a duplicate and silently drop it, changing
+    the configuration that is actually compiled.
+
+    Implied flags are removed so the same effective compiler configuration is
+    recognised even when it is spelled with a redundant flag.
+    """
+    constraints = getattr(cfg, "flag_constraints", None)
+    entries = [str(entry).strip() for entry in flag_entries if str(entry).strip()]
+    if constraints is not None and not constraints.is_empty:
+        return constraints.effective_signature(entries)
+    return tuple(dict.fromkeys(entries))
 
 
 # -----------------------------
@@ -370,7 +405,9 @@ def _neighbors(
             if f in s:
                 continue
             if constraints is not None and not constraints.is_empty:
-                if not constraints.can_add(f, active_now + list(pool_list)):
+                # Only exclusive groups are hard constraints here; an implied flag
+                # may still be generated and is handled as an equivalent node.
+                if not constraints.can_add_exclusive(f, active_now + list(pool_list)):
                     continue
             addables.append(f)
         rng.shuffle(addables)
@@ -397,7 +434,7 @@ def _neighbors(
 
     for nv, nparams, npool, nenv in neigh:
         if constraints is not None and not constraints.is_empty:
-            if not constraints.is_allowed(_active_flag_strings(cfg, nv, nparams) + list(npool)):
+            if not constraints.is_consistent(_active_flag_strings(cfg, nv, nparams) + list(npool)):
                 continue
         key = (
             nv,
@@ -655,35 +692,46 @@ def run_tabu_study(
             meta={"results_csv": str(results_csv)},
         )
 
-    def evaluate_one(k: int, flags_str: str, flags_key: str, env_dict: Dict[str, str]):
+    def evaluate_one(k: int, flag_entries: Sequence[str], env_dict: Dict[str, str]):
         """
-        Return (value, metrics, binary, eval_id) for one configuration.
+        Return (value, metrics, binary, eval_id, equivalent) for one configuration.
 
-        Recorded results are reused as-is; anything not on record is built and
-        measured, then appended to the CSV before the next step starts.
+        The requested flags are first reduced to their effective form (implied
+        flags removed), so two spellings of the same effective configuration
+        share one build and measurement. ``equivalent`` is True when that
+        effective configuration was already measured: its result is reused and
+        nothing is built or measured.
+
+        ``flag_entries`` is the list of configured flag entries, never a
+        whitespace-tokenised string: pool entries may themselves contain spaces
+        (for example ``-mllvm -enable-loop-flatten``).
         """
-        compile_key = evaluator.compile_key(flags_str)
+        effective_parts = _effective_signature(cfg, flag_entries)
+        effective_str = " ".join(effective_parts).strip()
+        effective_key = "|".join(effective_parts) if effective_parts else "default"
+
+        compile_key = evaluator.compile_key(effective_str)
         eid = eval_id(compile_key, env_dict)
         record = journal.lookup(eid)
         if record is not None:
-            return record.value, dict(record.metrics), record.binary, eid
+            return record.value, dict(record.metrics), record.binary, eid, True
 
         reason = journal.failure_reason(eid)
         if reason is not None:
             raise RuntimeError(f"known failure: {reason}")
 
-        run_dir = evaluator.run_dir_for(flags_str, env_dict)
+        run_dir = evaluator.run_dir_for(effective_str, env_dict)
         if tabu.clean_run_outputs:
             clean_run_outputs(run_dir, cfg.program_args, tabu.clean_globs)
         try:
-            evaluation = evaluator.evaluate(flags_str, env_dict, run_dir)
+            evaluation = evaluator.evaluate(effective_str, env_dict, run_dir)
             if metric_name not in evaluation.metrics:
                 raise RuntimeError(
                     f"objective metric '{metric_name}' missing; got {list(evaluation.metrics)}"
                 )
         except Exception as ex:
             journal.record_failure(
-                k=k, eid=eid, flags=flags_str, env=env_dict, reason=str(ex)
+                k=k, eid=eid, flags=effective_str, env=env_dict, reason=str(ex)
             )
             raise
 
@@ -692,8 +740,8 @@ def run_tabu_study(
             k=k,
             eval_id=eid,
             value=float(metrics[metric_name]),
-            flags_key=flags_key,
-            flags=flags_str,
+            flags_key=effective_key,
+            flags=effective_str,
             env=dict(env_dict),
             binary=str(evaluation.binary),
             compile_key=compile_key,
@@ -701,7 +749,7 @@ def run_tabu_study(
             cached=evaluation.cached,
         )
         journal.append(record)
-        return record.value, metrics, record.binary, eid
+        return record.value, metrics, record.binary, eid, False
 
 
     # ------------------------------------------------------------------
@@ -712,9 +760,9 @@ def run_tabu_study(
     if phase == "baseline":
         print("[tabu] evaluating baseline across environments")
         for i, e in enumerate(env_list, 1):
-            key, flags_str = _render_flags(cfg, base, variant, params_choice, pool_list)
+            key, flags_str, flag_parts = _render_flags(cfg, base, variant, params_choice, pool_list)
             try:
-                v, mets, binp, _eid = evaluate_one(0, flags_str, key, e)
+                v, mets, binp, _eid, _equivalent = evaluate_one(0, flag_parts, e)
                 sc = score(v)
             except Exception as ex:
                 print(f"[tabu] baseline env{i:03d} FAILED: {ex}")
@@ -750,6 +798,8 @@ def run_tabu_study(
         stop_after = int(iters if iters is not None else tabu.max_iters)
     print(f"[tabu] iterations done: {iters_done}; this run stops at {stop_after} ({budget} budget)")
 
+    max_skips = max(1, int(getattr(tabu, "max_skips", 50) or 50))
+    equivalent_streak = 0
     stop_reason = "iteration budget reached"
     finished = True
     install_sigterm_handler()
@@ -787,12 +837,12 @@ def run_tabu_study(
             cand_best_sc = math.inf
 
             for nv, nparams, npool, nenv in neigh:
-                nkey, nflags = _render_flags(cfg, base, nv, nparams, npool)
+                nkey, nflags, nparts = _render_flags(cfg, base, nv, nparams, npool)
                 # admissible if not tabu OR aspirates (improves global best)
                 is_tabu = (nkey + "|" + json.dumps(nenv, sort_keys=True)) in tabu_q
 
                 try:
-                    v, mets, binp, _eid = evaluate_one(attempt, nflags, nkey, nenv)
+                    v, mets, binp, _eid, equivalent = evaluate_one(attempt, nparts, nenv)
                     sc = score(v)
                 except Exception as ex:
                     message = str(ex)
@@ -805,7 +855,7 @@ def run_tabu_study(
                     continue
                 if sc < cand_best_sc:
                     cand_best_sc = sc
-                    cand_best = (nv, nparams, npool, nenv, v, mets, binp, nkey, nflags)
+                    cand_best = (nv, nparams, npool, nenv, v, mets, binp, nkey, nflags, equivalent)
 
             if cand_best is None:
                 print(f"[tabu] iter {attempt}: no admissible neighbor; stopping.")
@@ -816,7 +866,34 @@ def run_tabu_study(
             # Move to the best candidate and record the move as tabu
             variant, params_choice, pool_list, env = cand_best[0], cand_best[1], cand_best[2], cand_best[3]
             v, mets, binp, nkey, nflags = cand_best[4], cand_best[5], cand_best[6], cand_best[7], cand_best[8]
+            equivalent = bool(cand_best[9])
             tabu_q.append(nkey + "|" + json.dumps(env, sort_keys=True))
+
+            if equivalent:
+                # The node is still traversed (the search continues from it), but
+                # its result came from a previous configuration, so it is not a
+                # new iteration: neither the budget nor the no-improve counter move.
+                equivalent_streak += 1
+                print(
+                    f"[tabu] iter {attempt}: node equivalent to a previous configuration; "
+                    f"result reused (skip {equivalent_streak}/{max_skips})"
+                )
+                if score(v) < score(best_val):
+                    best_val = v
+                    best_key = nkey
+                    best_flags = nflags
+                    best_env = dict(env)
+                    best_metrics = dict(mets)
+                    best_binary = binp
+                snapshot("search")
+                if equivalent_streak >= max_skips:
+                    print(f"[tabu] stopping: {max_skips} consecutive equivalent nodes.")
+                    stop_reason = "consecutive equivalent nodes"
+                    finished = False
+                    break
+                continue
+
+            equivalent_streak = 0
             iters_done = attempt
 
             improved = score(v) < score(best_val)

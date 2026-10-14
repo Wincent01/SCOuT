@@ -125,6 +125,45 @@ class FlagConstraintsUnitTests(unittest.TestCase):
             "-fno-math-errno", "-ffp-contract=fast",
         }), [])
 
+    def test_expand_pool_adds_exclusive_members(self):
+        c = _sample_constraints()
+        expanded = c.expand_pool(["-ffast-math"])
+        self.assertEqual(expanded[0], "-ffast-math")
+        for flag in ("-funroll-loops", "-fno-unroll-loops",
+                     "-fstrict-aliasing", "-fno-strict-aliasing"):
+            self.assertIn(flag, expanded)
+        self.assertEqual(len(expanded), len(set(expanded)))
+        # implies values are NOT added implicitly
+        self.assertNotIn("-fno-math-errno", expanded)
+        self.assertNotIn("-ffp-contract=fast", expanded)
+
+    def test_can_add_exclusive_ignores_implies(self):
+        c = _sample_constraints()
+        # Implied: blocked as a hard constraint, allowed as a (redundant) node.
+        self.assertFalse(c.can_add("-funroll-loops", ["-O3"]))
+        self.assertTrue(c.can_add_exclusive("-funroll-loops", ["-O3"]))
+        # Exclusive conflict is blocked either way.
+        self.assertFalse(c.can_add_exclusive("-funroll-loops", ["-fno-unroll-loops"]))
+
+    def test_sanitize_exclusive_keeps_implied_flags(self):
+        c = _sample_constraints()
+        self.assertEqual(
+            c.sanitize_exclusive(["-O3", "-funroll-loops", "-fno-unroll-loops"]),
+            ["-O3", "-funroll-loops"],
+        )
+
+    def test_effective_signature_removes_implied_only(self):
+        c = _sample_constraints()
+        # Implied flags collapse into the implying flag ...
+        self.assertEqual(c.effective_signature(["-O3", "-funroll-loops"]), ("-O3",))
+        # ... but an exclusive conflict is never silently collapsed, otherwise two
+        # genuinely different configurations could look equivalent and one would
+        # be skipped.
+        self.assertEqual(
+            c.effective_signature(["-funroll-loops", "-fno-unroll-loops"]),
+            ("-funroll-loops", "-fno-unroll-loops"),
+        )
+
 
 class FlagConstraintsOptunaTests(unittest.TestCase):
     def test_implied_pool_flag_is_discarded(self):
@@ -207,6 +246,15 @@ class FlagConstraintsConfigTests(unittest.TestCase):
     def test_absent_flag_constraints_default_to_empty(self):
         cfg = Config.load(self.write_config())
         self.assertTrue(cfg.flag_constraints.is_empty)
+
+    def test_exclusive_flags_become_implicit_pool_members(self):
+        cfg = Config.load(self.write_config(
+            compiler_flag_pool=["-ffast-math"],
+            flag_constraints={"exclusive": [["-funroll-loops", "-fno-unroll-loops"]]},
+        ))
+        self.assertIn("-ffast-math", cfg.compiler_flag_pool)
+        self.assertIn("-funroll-loops", cfg.compiler_flag_pool)
+        self.assertIn("-fno-unroll-loops", cfg.compiler_flag_pool)
 
     def test_unknown_reference_loads_but_is_not_fatal(self):
         cfg = Config.load(self.write_config(flag_constraints={

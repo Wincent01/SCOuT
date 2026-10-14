@@ -21,7 +21,11 @@ from src.checkpoint import (
 from src.config import Config
 from src.evaluator import Evaluator
 from src.misc import clean_run_outputs, output_prefixes
-from src.searchMethods.tabu_flags import run_tabu_study
+from src.searchMethods.tabu_flags import (
+    _effective_signature,
+    _render_flags,
+    run_tabu_study,
+)
 
 
 def _fake_value(binary: str, env: dict) -> float:
@@ -131,9 +135,10 @@ class TabuResumeTests(unittest.TestCase):
         self.assertEqual(self.read_state()["search"]["iteration"], 2)
 
     def test_resume_continues_and_reuses_recorded_results(self):
-        cfg = self.load()
+        # A larger pool keeps the search from exhausting the space, so four real
+        # (non-equivalent) iterations are available.
+        cfg = self.load(compiler_flag_pool=["-ffast-math", "-funroll-loops", "-fstrict-aliasing"])
         self.run_study(cfg, iters=2)
-        first_measures = self.calls["measure"]
         rows_before = self.read_rows()
 
         self.run_study(cfg, resume=True, iters=4)
@@ -144,7 +149,8 @@ class TabuResumeTests(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         self.assertEqual(len(rows_after), self.calls["measure"])
         self.assertGreater(len(rows_after), len(rows_before))
-        self.assertLess(len(rows_after) - len(rows_before), first_measures)
+        # Resume reuses earlier results instead of re-measuring them.
+        self.assertEqual(rows_after[: len(rows_before)], rows_before)
 
         state = self.read_state()["search"]
         self.assertEqual(state["iteration"], 4)
@@ -166,7 +172,7 @@ class TabuResumeTests(unittest.TestCase):
         self.assertEqual(self.calls["build"], builds)
 
     def test_missing_state_file_keeps_recorded_results(self):
-        cfg = self.load()
+        cfg = self.load(compiler_flag_pool=["-ffast-math", "-funroll-loops", "-fstrict-aliasing"])
         self.run_study(cfg, iters=2)
         rows_before = len(self.read_rows())
         (self.root / "tabu.state.json").unlink()
@@ -198,7 +204,9 @@ class TabuResumeTests(unittest.TestCase):
         self.assertEqual(self.read_state()["search"]["iteration"], 1)
 
     def test_budget_modes(self):
-        cfg = self.load()
+        # A pool large enough that three real (non-equivalent) iterations are
+        # available; the tiny default pool can be exhausted and then stall.
+        cfg = self.load(compiler_flag_pool=["-ffast-math", "-funroll-loops", "-fstrict-aliasing"])
         self.run_study(cfg, iters=1, budget="lifetime")
         self.assertEqual(self.read_state()["search"]["iteration"], 1)
 
@@ -273,6 +281,78 @@ class TabuResumeTests(unittest.TestCase):
             tokens = set((row["compiler_flags"] or "").split("|"))
             self.assertIn("-O3", tokens)
             self.assertNotIn("-funroll-loops", tokens)
+
+    def test_equivalent_node_reuses_result_without_counting(self):
+        cfg = self.load(
+            compiler_flags_base="-O3",
+            compiler_flags=[],
+            compiler_flag_pool=["-funroll-loops"],
+            flag_constraints={"implies": {"-O3": ["-funroll-loops"]}},
+            tabu={
+                "max_iters": 10, "max_no_improve": 20, "max_skips": 3,
+                "tabu_tenure": 1, "neighborhood": 4,
+                "allow_variant_moves": False, "allow_param_moves": False,
+                "allow_pool_moves": True, "allow_env_moves": False,
+                "env_mode": "fixed", "env": {},
+                "results_csv": str(self.root / "tabu.csv"),
+            },
+        )
+        self.run_study(cfg, iters=10)
+        # Only the baseline effective configuration (-O3) is ever measured:
+        # "-O3 -funroll-loops" is equivalent because -O3 implies -funroll-loops.
+        self.assertEqual(len(self.read_rows()), 1)
+        self.assertEqual(self.calls["measure"], 1)
+        # Equivalent nodes are still traversed but do not count as iterations.
+        self.assertEqual(self.read_state()["search"]["iteration"], 0)
+
+    def test_multitoken_pool_entries_are_not_tokenised(self):
+        cfg = self.load(
+            compiler_flag_pool=[
+                "-mllvm -force-vector-interleave={2,4,8,16}",
+                "-mllvm -enable-loopinterchange",
+            ],
+            flag_constraints={"exclusive": [["-funroll-loops", "-fno-unroll-loops"]]},
+        )
+        entries = [
+            "-O2",
+            "-mllvm -enable-loop-flatten",
+            "-mllvm -enable-unroll-and-jam",
+        ]
+        # Entries are opaque: a pool item that contains a space must survive
+        # intact, including its repeated '-mllvm'.
+        self.assertEqual(list(_effective_signature(cfg, entries)), entries)
+
+        key, flags_str, parts = _render_flags(cfg, "", "-O2", {}, entries[1:])
+        self.assertEqual(parts, entries)
+        self.assertEqual(flags_str.count("-mllvm"), 2)
+        self.assertIn("-mllvm -enable-loop-flatten", key)
+        self.assertIn("-mllvm -enable-unroll-and-jam", key)
+
+    def test_multitoken_entries_survive_into_results_csv(self):
+        cfg = self.load(
+            compiler_flag_pool=[
+                "-mllvm -enable-loop-flatten",
+                "-mllvm -enable-unroll-and-jam",
+            ],
+            flag_constraints={"exclusive": [["-funroll-loops", "-fno-unroll-loops"]]},
+            tabu={
+                "max_iters": 4, "max_no_improve": 20, "tabu_tenure": 4,
+                "neighborhood": 6, "allow_variant_moves": False,
+                "allow_param_moves": False, "allow_pool_moves": True,
+                "allow_env_moves": False, "env_mode": "fixed", "env": {},
+                "results_csv": str(self.root / "tabu.csv"),
+            },
+        )
+        self.run_study(cfg, iters=4)
+        rows = self.read_rows()
+        self.assertTrue(rows)
+        for row in rows:
+            key = row["compiler_flags"] or ""
+            # Every generated configuration keeps the full multi-token entry.
+            if "-enable-loop-flatten" in key:
+                self.assertIn("-mllvm -enable-loop-flatten", key)
+            if "-enable-unroll-and-jam" in key:
+                self.assertIn("-mllvm -enable-unroll-and-jam", key)
 
     def test_resume_refuses_changed_flag_constraints(self):
         self.run_study(

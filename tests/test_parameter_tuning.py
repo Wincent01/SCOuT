@@ -11,9 +11,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from src import build
-from src.config import BuildProject, Config
+from src.config import BuildProject, Config, LikwidConfig, MetricSpec, PerfConfig
 from src.evaluator import Evaluator
-from src.metrics import _SYCL_RE, _measurement_env
+from src.metrics import (
+    _SYCL_RE,
+    _measurement_env,
+    measure_likwid,
+    measure_perf,
+    resolve_run_cwd,
+)
 from src.misc import _render_one_param
 from src.searchMethods.anneal_flags import _score as anneal_score
 
@@ -126,6 +132,79 @@ class ParameterTuningTests(unittest.TestCase):
         key, flag = _render_one_param(trial, "--tile={}", [16])
         self.assertEqual(key, "--tile=16")
         self.assertEqual(flag, "--tile=16")
+
+    def test_run_cwd_resolver_options(self):
+        binary = self.root / "build" / "bin" / "program"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("x")
+        project = BuildProject(self.root, "cmake", target="program")
+
+        # default / process -> inherit SCOuT's cwd
+        self.assertIsNone(resolve_run_cwd("process", binary, self.root / "wd", project))
+        self.assertIsNone(resolve_run_cwd(None, binary, self.root / "wd", project))
+        self.assertEqual(resolve_run_cwd("binary_dir", binary, self.root / "wd", project), binary.parent)
+        self.assertEqual(resolve_run_cwd("project_dir", binary, self.root / "wd", project), self.root)
+        self.assertEqual(resolve_run_cwd("workdir", binary, self.root / "wd", project), self.root / "wd")
+        # unknown -> binary_dir, matching the parser fallback
+        self.assertEqual(resolve_run_cwd("whatever", binary, None, None), binary.parent)
+
+    def test_measure_perf_runs_in_configured_cwd(self):
+        binary = self.root / "build" / "bin" / "program"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("x")
+        seen = []
+
+        def fake_run(cmd, *, cwd=None, env=None):
+            seen.append(cwd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="1000 cycles\n500 instructions\n")
+
+        with patch("src.metrics._run", fake_run):
+            measure_perf(
+                PerfConfig(events=["cycles", "instructions"], core_list=None, run_cwd="binary_dir"),
+                binary, ["-nsteps", "1"], {}, 1,
+                clear_runtime_cache=False,
+            )
+        self.assertEqual(seen, [binary.parent])
+
+        seen.clear()
+        with patch("src.metrics._run", fake_run):
+            measure_perf(
+                PerfConfig(events=["cycles"], core_list=None),
+                binary, [], {}, 1,
+                clear_runtime_cache=False,
+            )
+        self.assertEqual(seen, [None])  # None -> child inherits SCOuT's cwd
+
+    def test_measure_likwid_runs_in_configured_cwd(self):
+        binary = self.root / "build" / "bin" / "program"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("x")
+        seen = []
+
+        def fake_run(cmd, *, cwd=None, env=None):
+            seen.append(cwd)
+            return SimpleNamespace(returncode=0, stdout="| cycles | 100 |\n", stderr="")
+
+        likwid = LikwidConfig(
+            group=None, events=["cycles"], metrics=[MetricSpec(name="cycles")],
+            core_list=None, run_cwd="workdir",
+        )
+        with patch("src.metrics._run", fake_run):
+            measure_likwid(
+                likwid, binary, [], {}, 1,
+                workdir=self.root / "wd", clear_runtime_cache=False,
+            )
+        self.assertEqual(seen, [self.root / "wd"])
+
+    def test_run_cwd_config_is_validated(self):
+        cfg = Config.load(self.write_config(perf={"events": ["cycles"], "run_cwd": "binary_dir"}))
+        self.assertEqual(cfg.perf.run_cwd, "binary_dir")
+        self.assertEqual(
+            Config.load(self.write_config(perf={"events": ["cycles"]})).perf.run_cwd,
+            "process",
+        )
+        with self.assertRaisesRegex(ValueError, "run_cwd"):
+            Config.load(self.write_config(perf={"events": ["cycles"], "run_cwd": "nonsense"}))
 
     def test_parser_accepts_scientific_notation(self):
         match = _SYCL_RE.search("[SYCL][avg] kernel 2: 1.25e-06 s over 10 iters")

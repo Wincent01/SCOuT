@@ -145,10 +145,12 @@ out or repeat a flag an optimization level already enables. Declare those rules 
 ```
 
 - `exclusive` lists groups of which **at most one** flag may be active at a time. The search never
-  emits a configuration containing two members of the same group.
+  emits a configuration containing two members of the same group. Members of an exclusive group are
+  part of the flag space implicitly, so they do not have to be listed in `compiler_flag_pool` too
+  (unlike `implies` values, which must be listed explicitly).
 - `implies` maps an active flag (a `compiler_flags` entry such as `-O3`, or a pool flag such as
-  `-ffast-math`) to the flags it already enables. Those flags are **redundant** and are dropped while
-  the source flag is active. The relation is applied transitively.
+  `-ffast-math`) to the flags it already enables. Those flags are **redundant** while the source flag
+  is active. The relation is applied transitively.
 
 Flags are matched by exact string equality against entries of `compiler_flags` and
 `compiler_flag_pool` (and rendered `compiler_params`). Referencing a flag that is not in the space
@@ -158,10 +160,23 @@ only logs a warning.
 override experiments testable — with `-O3` implying `-funroll-loops`, `-O3 -funroll-loops` is
 redundant and skipped while `-O3 -fno-unroll-loops` is still explored.
 
-Enforcement covers `tabu` and `optuna`; `anneal`, `beam_tabu` and `wavefront` apply the same rules
-on a best-effort basis. The rules are part of the tabu resume fingerprint, so changing them
-invalidates an existing `--resume` checkpoint. The flags implied by `-O2`/`-O3` are
-compiler-specific — confirm the mapping against your toolchain.
+### Equivalent configurations in tabu
+
+`tabu` keeps implied flags in the search space rather than deleting them: a configuration such as
+`-O3 -funroll-loops` is still a node the search can move to. Before building anything, the requested
+flags are reduced to their effective form (implied flags removed); when that effective configuration
+was already measured, the earlier result is reused and nothing is built or measured again. Two flag
+lists are only treated as equivalent when they have the same effective flags *and* the same
+environment, so a genuinely different configuration is never skipped.
+
+Because such a node adds no new information it does not count as an iteration: neither the iteration
+budget nor the no-improvement counter advances. `tabu.max_skips` (default `50`) bounds how many
+consecutive equivalent nodes may be traversed before the search stops with
+`consecutive equivalent nodes`.
+
+`optuna` and the other searches prune implied flags from their space instead. The rules are part of
+the tabu resume fingerprint, so changing them invalidates an existing `--resume` checkpoint. The
+flags implied by `-O2`/`-O3` are compiler-specific, confirm the mapping against your toolchain.
 
 ## Build and AdaptiveCpp cache reuse
 
@@ -278,6 +293,28 @@ For `perf`, commonly use:
 },
 "objectives": [{"metric": "CPI", "goal": "min"}]
 ```
+
+### Working directory (`run_cwd`)
+
+All three backends select the directory the measured program runs in with `run_cwd`:
+
+```json
+"perf": {
+  "events": ["cycles", "instructions"],
+  "run_cwd": "binary_dir"
+}
+```
+
+- `process` (default for `perf`/`likwid`) inherits SCOuT's own working directory.
+- `binary_dir` runs the program next to the built executable and is the `parser` default. Use it
+  when the workload writes result files into the current directory, so they land in the per-build
+  directory instead of wherever SCOuT was launched.
+- `project_dir` uses the configured project directory.
+- `workdir` uses the per-evaluation scratch directory (`runs/<key>/<env>`), which is also where
+  tabu removes stale outputs before re-measuring.
+
+Relative paths in `program_args` are resolved against the chosen directory. The `parser` backend
+additionally accepts `prefix`.
 
 For the parser backend, a program line looks like:
 

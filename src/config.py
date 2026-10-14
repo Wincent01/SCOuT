@@ -19,6 +19,22 @@ Number = float
 EnvMap = Dict[str, str]
 MetricDict = Dict[str, Number]
 
+# Working directory options for a measured program.
+#   process     - inherit SCOuT's own working directory (legacy default)
+#   binary_dir  - the directory holding the built executable (parser default)
+#   project_dir - the configured project directory
+#   workdir     - the per-evaluation scratch directory
+RUN_CWD_MODES = ("process", "cwd", "binary_dir", "project_dir", "workdir")
+
+
+def _validate_run_cwd(value: Any, *, block: str) -> str:
+    mode = str(value if value is not None else "process").strip().lower()
+    if mode not in RUN_CWD_MODES:
+        raise ValueError(
+            f"{block}.run_cwd must be one of {', '.join(RUN_CWD_MODES)} (got {value!r})"
+        )
+    return mode
+
 ###############################################################################
 # Local imports                                                               #
 ###############################################################################
@@ -50,14 +66,17 @@ class PerfConfig:
     events: List[str]
     core_list: Optional[str]
     warmup_runs: int = 0
-    
+    # Working directory of the measured program. "process" (default) keeps
+    # SCOuT's own cwd; "binary_dir" mirrors the parser backend.
+    run_cwd: Optional[str] = "process"
 
     @classmethod
     def from_dict(cls, d: Dict) -> "PerfConfig":
         return cls(
             events=d.get("events", ["cycles", "instructions"]),
             core_list=d.get("core_list"),
-            warmup_runs=int(d.get("warmup_runs", 0))
+            warmup_runs=int(d.get("warmup_runs", 0)),
+            run_cwd=_validate_run_cwd(d.get("run_cwd"), block="perf"),
         )
 
 
@@ -116,6 +135,8 @@ class LikwidConfig:
     metrics: List[MetricSpec]
     core_list: Optional[str]
     warmup_runs: int = 0
+    # Same working-directory options as the perf backend.
+    run_cwd: Optional[str] = "process"
 
     @classmethod
     def from_dict(cls, d: Dict) -> "LikwidConfig":
@@ -138,6 +159,7 @@ class LikwidConfig:
             metrics=metrics,
             core_list=d.get("core_list"),
             warmup_runs=int(d.get("warmup_runs", 0)),
+            run_cwd=_validate_run_cwd(d.get("run_cwd"), block="likwid"),
         )
 
 
@@ -538,6 +560,11 @@ class Config:
         # Declarative flag constraints (exclusive groups / implied flags)
         flag_constraints = FlagConstraints.from_dict(raw.get("flag_constraints"))
 
+        # Exclusive-group members are part of the flag space implicitly; they do
+        # not need to be repeated in compiler_flag_pool. ``implies`` values do.
+        raw_flag_pool = [str(flag) for flag in (raw.get("compiler_flag_pool", []) or [])]
+        flag_pool = flag_constraints.expand_pool(raw_flag_pool)
+
         # Environment space
         env_schema = raw.get("env")
         if not isinstance(env_schema, dict):
@@ -625,7 +652,7 @@ class Config:
             if isinstance(raw_flags, dict):
                 raw_flags = list(raw_flags.values())
             universe = {str(flag) for flag in raw_flags}
-            universe |= {str(flag) for flag in (raw.get("compiler_flag_pool", []) or [])}
+            universe |= {str(flag) for flag in flag_pool}
             for message in flag_constraints.validate_against(universe):
                 LOG.log(f"[config] warning: {message}")
 
@@ -638,7 +665,7 @@ class Config:
             compiler_flags=raw.get("compiler_flags", []),
             compiler_params = compiler_params,
             compiler_params_select = compiler_params_select,
-            compiler_flag_pool  = raw.get("compiler_flag_pool", []),
+            compiler_flag_pool  = flag_pool,
             program_args=program_args,
             env=env_schema,
             perf=PerfConfig.from_dict(raw.get("perf", {})) if backend == "perf" else None,
