@@ -4,12 +4,13 @@ from __future__ import annotations
 # Standard library imports                                                    #
 ###############################################################################
 
+import dataclasses
 import os
 import re
 import sys, subprocess
 from pathlib import Path
-from statistics import mean, variance, median
-from typing import Dict, List, Optional, Sequence, Tuple, Any, Union
+from statistics import mean, median, stdev, variance
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 ###############################################################################
 # Type helpers                                                                #
@@ -41,6 +42,24 @@ def _measurement_env(env: EnvMap, managed_env_keys: Sequence[str] = ()) -> EnvMa
         merged.pop(str(key), None)
     merged.update({str(k): str(v) for k, v in env.items()})
     return merged
+
+
+def _mean_and_stdev(buckets: Mapping[str, Sequence[Number]]) -> MetricDict:
+    """
+    Reduce per-run metric buckets to their mean and, when more than one sample
+    is available, the sample standard deviation published as ``<metric>_stdev``.
+
+    A single sample has no defined sample standard deviation, so the
+    ``_stdev`` key is omitted in that case.
+    """
+    summary: MetricDict = {}
+    for key, values in buckets.items():
+        if not values:
+            continue
+        summary[str(key)] = mean(values)
+        if len(values) > 1:
+            summary[f"{key}_stdev"] = stdev(values)
+    return summary
 
 
 def perf_parse(stderr: str, events: Sequence[str]) -> MetricDict:
@@ -99,7 +118,7 @@ def measure_perf(
     
     if clear_runtime_cache:
         clear_acpp_runtime_cache()
-    return {k: mean(v) for k, v in buckets.items() if v}
+    return _mean_and_stdev(buckets)
 
 
 _ROW_RE   = re.compile(r"^\|\s*([^|]+?)\s*\|(.+)$")
@@ -226,7 +245,7 @@ def measure_likwid(
 
     if clear_runtime_cache:
         clear_acpp_runtime_cache()
-    return {k: mean(v) for k, v in buckets.items() if v}
+    return _mean_and_stdev(buckets)
 
 
 ###############################################################################
@@ -250,6 +269,83 @@ _GROMACS_PERF_RE = re.compile(
     re.IGNORECASE,
 )
 
+_GMX_DEVICE_LINE_RE = re.compile(r"^\s*#(?P<id>\d+):\s*(?P<desc>.*\S)\s*$")
+_GMX_GPU_MAPPING_RE = re.compile(r"(?P<task>PP|PME):(?P<id>\d+)")
+
+
+def _gromacs_log_path(prog_args: Sequence[str], cwd: Path) -> Path:
+    """Locate the mdrun .log file from -g / -deffnm (default md.log)."""
+    args = list(prog_args)
+    for opt, suffix in (("-g", ""), ("-deffnm", ".log")):
+        if opt in args and args.index(opt) + 1 < len(args):
+            return cwd / (args[args.index(opt) + 1] + suffix)
+    return cwd / "md.log"
+
+
+def report_gromacs_device(cfg: ParserConfig, prog_args: Sequence[str], cwd: Path, logs: Path,
+                          stdout: str, stderr: str) -> None:
+    """
+    Print the SYCL devices mdrun detected and the device each GPU task was mapped to,
+    and keep the raw run output (e.g. ACPP_DEBUG_LEVEL messages) under ``logs``.
+    Raises if ``cfg.expect_device`` is set and the selected device does not match.
+    """
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "device_run.out").write_text(stdout or "")
+    (logs / "device_run.err").write_text(stderr or "")
+
+    md_log = _gromacs_log_path(prog_args, cwd)
+    text = md_log.read_text(errors="replace") if md_log.exists() else ""
+
+    # "GPU info:" block of the hardware report: one "#<id>: name: ..., status: ..." line per device.
+    devices: Dict[int, str] = {}
+    in_gpu_info = False
+    for line in text.splitlines():
+        if line.strip() == "GPU info:":
+            in_gpu_info = True
+            continue
+        if in_gpu_info:
+            m = _GMX_DEVICE_LINE_RE.match(line)
+            if m:
+                devices[int(m.group("id"))] = m.group("desc")
+            elif not line.strip() or not line.startswith("    "):
+                in_gpu_info = False
+
+    # Task assignment, e.g. "Mapping of GPU IDs to the 2 GPU tasks ...:\n  PP:0,PME:0"
+    lines = text.splitlines()
+    assignment: List[Tuple[str, int]] = []
+    usage: List[str] = []
+    for idx, line in enumerate(lines):
+        if line.startswith("Mapping of GPU IDs") and idx + 1 < len(lines):
+            assignment = [(m.group("task"), int(m.group("id")))
+                          for m in _GMX_GPU_MAPPING_RE.finditer(lines[idx + 1])]
+        if re.match(r"^(\d+ GPUs? selected|PP tasks? will|PME tasks? will)", line):
+            usage.append(line.strip())
+
+    tag = "[scout][gmx-device]"
+    print(f"{tag} mdrun log: {md_log}{'' if text else ' (not found)'}", flush=True)
+    print(f"{tag} raw output of this run saved under {logs}/device_run.{{out,err}}", flush=True)
+    if not devices:
+        print(f"{tag} no 'GPU info' devices in log (no SYCL devices detected/visible)", flush=True)
+    for dev_id, desc in sorted(devices.items()):
+        print(f"{tag} detected #{dev_id}: {desc}", flush=True)
+    for line in usage:
+        print(f"{tag} {line}", flush=True)
+    if not assignment:
+        print(f"{tag} no GPU tasks assigned: all work ran on the host CPU (native SIMD), "
+              f"not through SYCL", flush=True)
+    for task, dev_id in assignment:
+        print(f"{tag} {task} task -> #{dev_id}: {devices.get(dev_id, '<unknown device>')}", flush=True)
+
+    if cfg.expect_device:
+        if not assignment:
+            raise RuntimeError(f"expect_device={cfg.expect_device!r} but mdrun assigned no GPU tasks "
+                               f"(see {md_log})")
+        for task, dev_id in assignment:
+            desc = devices.get(dev_id, "")
+            if not re.search(cfg.expect_device, desc):
+                raise RuntimeError(f"{task} task ran on device #{dev_id} ({desc or 'unknown'}), "
+                                   f"which does not match expect_device={cfg.expect_device!r}")
+
 def resolve_run_cwd(
     run_cwd: Optional[str],
     bin_path: Path,
@@ -272,7 +368,7 @@ def resolve_run_cwd(
     if mode == "workdir":
         return Path(workdir) if workdir is not None else Path(bin_path).parent
     if mode == "project_dir":
-        return Path(project.dir) if project is not None else Path(bin_path).parent
+        return project.resolved_dir() if project is not None else Path(bin_path).parent
     # "binary_dir" and anything unrecognised
     return Path(bin_path).parent
 
@@ -334,6 +430,14 @@ def measure_parser_sycl(
             (logs / f"rc_{proc.returncode}_{i:02d}.err").write_text(proc.stderr or "")
             text = ((proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")).strip()
             excerpt = text[-1200:] if text else "<no stdout/stderr>"
+            if (cfg.format or "").lower() == "gromacs" and (cfg.device_report or cfg.expect_device):
+                # mdrun logs device detection and GPU task mapping before launching kernels,
+                # so the report is still informative for a crashed run.
+                try:
+                    report_gromacs_device(dataclasses.replace(cfg, expect_device=None), prog_args, cwd,
+                                          logs, proc.stdout or "", proc.stderr or "")
+                except Exception as exc:
+                    print(f"[scout][gmx-device] report failed: {exc}", flush=True)
             raise RuntimeError(
                 f"program exited with rc={proc.returncode}; "
                 f"logs saved under {logs}; output excerpt:\n{excerpt}"
@@ -345,6 +449,9 @@ def measure_parser_sycl(
 
         parse_format = (getattr(cfg, "format", "sycl") or "sycl").lower()
         if parse_format == "gromacs":
+            if i == 0 and (cfg.device_report or cfg.expect_device):
+                report_gromacs_device(cfg, prog_args, cwd, (workdir or cwd) / "parser_logs",
+                                      proc.stdout or "", proc.stderr or "")
             # Discard warm-up runs so the average covers exactly `runs` measurements.
             if is_warmup:
                 continue
@@ -408,6 +515,15 @@ def measure_parser_sycl(
             "gmx_ms_per_step": float(mean(ms_per_step_vals)) if ms_per_step_vals else 0.0,
             "gmx_matom_steps_per_s": float(mean(matom_steps_vals)) if matom_steps_vals else 0.0,
         }
+        # Sample standard deviation across the measurement repetitions.
+        for key, values in (
+            ("gmx_ns_per_day", ns_per_day_vals),
+            ("gmx_hour_per_ns", hour_per_ns_vals),
+            ("gmx_ms_per_step", ms_per_step_vals),
+            ("gmx_matom_steps_per_s", matom_steps_vals),
+        ):
+            if len(values) > 1:
+                mets[f"{key}_stdev"] = float(stdev(values))
         if clear_runtime_cache:
             clear_acpp_runtime_cache()
         return mets
@@ -421,10 +537,14 @@ def measure_parser_sycl(
         selected = all_kids
 
     per_kernel_avg: Dict[int, float] = {}
+    per_kernel_stdev: Dict[int, float] = {}
     for k in selected:
         vals = [d[k] for d in runs_kernel_vals if k in d]
-        if vals:
-            per_kernel_avg[k] = float(mean(vals))
+        if not vals:
+            continue
+        per_kernel_avg[k] = float(mean(vals))
+        if len(vals) > 1:
+            per_kernel_stdev[k] = float(stdev(vals))
 
     if not per_kernel_avg:
         raise RuntimeError("Parser backend (SYCL): selected kernels missing in output.")
@@ -432,13 +552,25 @@ def measure_parser_sycl(
     # aggregate across selected kernels
     aggregate_val = _aggregate(list(per_kernel_avg.values()), cfg.aggregate)
 
+    # Aggregate each run over the selected kernels present in it, so the stddev of
+    # the aggregate reflects run-to-run variation rather than kernel composition.
+    per_run_aggregate = [
+        _aggregate([d[k] for k in selected if k in d], cfg.aggregate)
+        for d in runs_kernel_vals
+        if any(k in d for k in selected)
+    ]
+
     # build metrics dict
     mets: MetricDict = {}
-    # per-kernel seconds
+    # per-kernel seconds (mean + stddev across runs)
     for k, v in per_kernel_avg.items():
         mets[f"sycl_kernel_{k}_{cfg.label}_s"] = v
+        if k in per_kernel_stdev:
+            mets[f"sycl_kernel_{k}_{cfg.label}_s_stdev"] = per_kernel_stdev[k]
     # aggregate seconds
     mets[f"sycl_{cfg.label}_{cfg.aggregate}_s"] = aggregate_val
+    if len(per_run_aggregate) > 1:
+        mets[f"sycl_{cfg.label}_{cfg.aggregate}_s_stdev"] = float(stdev(per_run_aggregate))
 
     # if iterations consistent and positive, report it too
     if all(i == iterations_seen[0] and i >= 0 for i in iterations_seen):

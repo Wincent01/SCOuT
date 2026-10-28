@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import sys
 from pathlib import Path
 from statistics import mean, variance
@@ -115,6 +116,13 @@ class ParserConfig:
     prefix: Optional[List[str]] = None # e.g. ["numactl","-N","0","-m","0"]
     run_cwd: str = "binary_dir"        # "binary_dir" | "project_dir" | "workdir"
 
+    # GROMACS only: after the first run, print which SYCL device mdrun mapped its
+    # GPU tasks to (parsed from the mdrun .log) and keep that run's stdout/stderr.
+    device_report: bool = False
+    # GROMACS only: regex that every selected device line must match, e.g.
+    # "Portable Computing Language|cpu-.*" for PoCL; implies device_report.
+    expect_device: Optional[str] = None
+
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ParserConfig":
         return cls(
@@ -126,6 +134,8 @@ class ParserConfig:
             prefix=d.get("prefix"),
             run_cwd=d.get("run_cwd", "binary_dir"),
             warmup_runs=int(d.get("warmup_runs", 0)),
+            device_report=bool(d.get("device_report", False)),
+            expect_device=d.get("expect_device"),
         )
 
 @dataclasses.dataclass
@@ -194,6 +204,16 @@ class BuildProject:
             cmake_flag_vars=d.get("cmake_flag_vars", ["CMAKE_CXX_FLAGS"]),
             cmake_defs=d.get("cmake_defs", []),
         )
+
+    # ``dir`` and ``cmake_defs`` may reference environment variables such as
+    # $TMPDIR (e.g. a per-job, node-local source copy). They are kept unexpanded
+    # so compile keys and the resume fingerprint stay stable across jobs, and
+    # are only expanded where the build actually uses them.
+    def resolved_dir(self) -> Path:
+        return Path(os.path.expandvars(str(self.dir)))
+
+    def resolved_cmake_defs(self) -> List[str]:
+        return [os.path.expandvars(d) for d in self.cmake_defs]
 
 
 @dataclasses.dataclass
@@ -639,8 +659,8 @@ class Config:
         loaded_source = Path(source) if source else None
         if loaded_source is not None and not loaded_source.is_file():
             raise ValueError(f"source does not exist: {loaded_source}")
-        if loaded_project is not None and not loaded_project.dir.is_dir():
-            raise ValueError(f"project.dir does not exist: {loaded_project.dir}")
+        if loaded_project is not None and not loaded_project.resolved_dir().is_dir():
+            raise ValueError(f"project.dir does not exist: {loaded_project.resolved_dir()}")
         if loaded_project is not None and loaded_project.executable is None:
             raise ValueError(
                 "project.executable is required; build target names such as 'all' "

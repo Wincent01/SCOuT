@@ -424,6 +424,62 @@ class TabuResumeTests(unittest.TestCase):
         self.assertIn("cycles", header)
         self.assertIn("instructions", header)
 
+    def test_objective_stdev_is_recorded_in_the_results_csv(self):
+        def measure_with_stdev(_cfg, _binary, _args, env, _runs, **_kwargs):
+            return {"CPI": _fake_value(str(_binary), env), "CPI_stdev": 0.125}
+
+        with patch("src.evaluator.measure_perf", measure_with_stdev):
+            self.run_study(self.load(), iters=2)
+
+        rows = self.read_rows()
+        self.assertTrue(rows)
+        self.assertIn("CPI_stdev", rows[0])
+        for row in rows:
+            self.assertAlmostEqual(float(row["CPI_stdev"]), 0.125)
+        # The stddev is an extra column next to the objective, not a replacement.
+        with open(self.root / "tabu.csv", newline="") as fp:
+            header = next(csv.reader(fp))
+        self.assertIn("CPI", header)
+        self.assertIn("CPI_stdev", header)
+
+    def test_objective_stdev_survives_resume(self):
+        def measure_with_stdev(_cfg, _binary, _args, env, _runs, **_kwargs):
+            return {"CPI": _fake_value(str(_binary), env), "CPI_stdev": 0.5}
+
+        with patch("src.evaluator.measure_perf", measure_with_stdev):
+            cfg = self.load(compiler_flag_pool=["-ffast-math", "-funroll-loops", "-fstrict-aliasing"])
+            self.run_study(cfg, iters=2)
+            self.run_study(cfg, resume=True, iters=4)
+
+        rows = self.read_rows()
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertIn("CPI_stdev", row)
+
+    def test_journal_round_trips_metric_stdev(self):
+        journal = RunJournal(
+            self.root / "s.csv",
+            objective_metrics=["CPI"],
+            failure_path=self.root / "s_failed.csv",
+        )
+        journal.append(
+            EvalRecord(
+                k=0, eval_id="e1", value=1.0, flags_key="-O2", flags="-O2",
+                env={"MODE": "a"}, binary="/tmp/bin", compile_key="c0",
+                metrics={"CPI": 1.0, "CPI_stdev": 0.01},
+            )
+        )
+        reopened = RunJournal(
+            self.root / "s.csv",
+            objective_metrics=["CPI"],
+            failure_path=self.root / "s_failed.csv",
+        )
+        reopened.load()
+        with open(self.root / "s.csv", newline="") as fp:
+            header = next(csv.reader(fp))
+        self.assertIn("CPI_stdev", header)
+        self.assertAlmostEqual(reopened.lookup("e1").metrics["CPI_stdev"], 0.01)
+
     def test_eval_id_identifies_flags_and_environment(self):
         self.assertEqual(eval_id("k", {"A": "1", "B": "2"}), eval_id("k", {"B": "2", "A": "1"}))
         self.assertNotEqual(eval_id("k", {"A": "1"}), eval_id("k", {"A": "2"}))
