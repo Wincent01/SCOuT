@@ -1,0 +1,95 @@
+{
+  "backend": "parser",
+  "project": {
+    "dir": "/cephyr/users/wincenth/Vera/ra/gromacs/gromacs-2026.3",
+    "build_system": "cmake",
+    "target": "gmx",
+    "executable": "bin/gmx",
+    "cmake_flag_vars": ["CMAKE_CXX_FLAGS"],
+    "cmake_defs": [
+      "CMAKE_C_COMPILER=/usr/lib/llvm-18/bin/clang",
+      "CMAKE_CXX_COMPILER=/usr/lib/llvm-18/bin/clang++",
+      "GMX_SYCL=ACPP",
+      "GMX_GPU=SYCL",
+      "ACPP_TARGETS=cuda:sm_86",
+      "GMX_BUILD_OWN_FFTW=ON",
+      "REGRESSIONTEST_DOWNLOAD=ON",
+      "BUILD_TESTING=OFF"
+    ]
+  },
+  "compiler": "acpp",
+  "runtime_cache_policy": "reuse",
+  "compiler_flags_base": "",
+  "compiler_flags": ["-O2", "-O3"],
+  "compiler_flag_pool": [
+    "-ffast-math",
+    "-ffp-contract=fast",
+    "-fcuda-flush-denormals-to-zero",
+    "-fcuda-approx-transcendentals"
+  ],
+  "flag_constraints": {
+    "exclusive": [],
+    "implies": {
+      "-ffast-math": ["-ffp-contract=fast"]
+    }
+  },
+  "compiler_params": {
+    "-mllvm -unroll-threshold": [150, 300, 600],
+    "-mllvm -inline-threshold": [225, 500, 1000],
+    "-Xcuda-ptxas --maxrregcount": [64, 96, 128]
+  },
+  "compiler_params_select": {
+    "min": 0,
+    "max": 3
+  },
+  "program_args": [
+    "mdrun",
+    "-s",
+    "/cephyr/users/wincenth/Vera/ra/gromacs/SCOuT/runfiles/cubic.tpr",
+    "-deffnm", "scout_gpu_acpp",
+    "-nsteps", "5000",
+    "-noconfout",
+    "-ntmpi", "1",
+    "-ntomp", "32",
+    "-pin", "on",
+    "-nb", "gpu",
+    "-pme", "gpu",
+    "-bonded", "gpu",
+    "-update", "gpu"
+  ],
+  "env": {
+    
+  },
+  "objectives": [
+    { "metric": "gmx_ns_per_day", "goal": "max" }
+  ],
+  "search": {
+    "study": "tabu",
+    "random_seed": 17
+  },
+  "tabu": {
+    "max_iters": 32,
+    "max_no_improve": 5,
+    "tabu_tenure": 8,
+    "neighborhood": 4,
+    "allow_variant_moves": true,
+    "allow_param_moves": true,
+    "allow_pool_moves": true,
+    "allow_env_moves": true,
+    "env_mode": "sample",
+    "env_cap": 4,
+    "results_csv": "./tabu_gpu_acpp_a40.csv",
+    "clean_run_outputs": true,
+    "clean_globs": ["mdout.mdp"]
+  },
+  "parser": {
+    "label": "sum",
+    "aggregate": "sum",
+    "run_cwd": "binary_dir",
+    "warmup_runs": 2,
+    "format": "gromacs"
+  },
+  "runs": 8,
+  "csv_log": "./tabu_gpu_acpp_a40_unused.csv",
+  "failed_builds": "./tabu_gpu_acpp_a40_failed.csv"
+}
